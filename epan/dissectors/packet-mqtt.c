@@ -31,6 +31,8 @@
  * http://docs.oasis-open.org/mqtt/mqtt/v5.0/
  *
  */
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "config.h"
 #include <epan/packet.h>
@@ -93,23 +95,24 @@ static const value_string mqtt_protocol_version_vals[] = {
   { 0,                     NULL }
 };
 
+// TODO: Support Long/Short Descriptions
 static const value_string mqtt_msgtype_vals[] = {
   { MQTT_RESERVED,          "Reserved" },
-  { MQTT_CONNECT,           "Connect Command" },
-  { MQTT_CONNACK,           "Connect Ack" },
-  { MQTT_PUBLISH,           "Publish Message" },
-  { MQTT_PUBACK,            "Publish Ack" },
-  { MQTT_PUBREC,            "Publish Received" },
-  { MQTT_PUBREL,            "Publish Release" },
-  { MQTT_PUBCOMP,           "Publish Complete" },
-  { MQTT_SUBSCRIBE,         "Subscribe Request" },
-  { MQTT_SUBACK,            "Subscribe Ack" },
-  { MQTT_UNSUBSCRIBE,       "Unsubscribe Request" },
-  { MQTT_UNSUBACK,          "Unsubscribe Ack" },
-  { MQTT_PINGREQ,           "Ping Request" },
-  { MQTT_PINGRESP,          "Ping Response" },
-  { MQTT_DISCONNECT,        "Disconnect Req" },
-  { MQTT_AUTH,              "Authentication Exchange" },
+  { MQTT_CONNECT,           "Connect" },
+  { MQTT_CONNACK,           "ConnAck" },
+  { MQTT_PUBLISH,           "Publish" },
+  { MQTT_PUBACK,            "PubAck" },
+  { MQTT_PUBREC,            "PubRec" },
+  { MQTT_PUBREL,            "PubRel" },
+  { MQTT_PUBCOMP,           "PubCom" },
+  { MQTT_SUBSCRIBE,         "Subscribe" },
+  { MQTT_SUBACK,            "SubAck" },
+  { MQTT_UNSUBSCRIBE,       "Unsubscribe" },
+  { MQTT_UNSUBACK,          "UnsubAck" },
+  { MQTT_PINGREQ,           "PingReq" },
+  { MQTT_PINGRESP,          "PingResp" },
+  { MQTT_DISCONNECT,        "Disconnect" },
+  { MQTT_AUTH,              "Auth" },
   { MQTT_RESERVED_16,       "Reserved" },
   { 0,                      NULL }
 };
@@ -170,6 +173,7 @@ static const value_string mqtt_conack_vals[] = {
 /* The protocol version is present in the CONNECT message. */
 typedef struct {
     guint8 runtime_proto_version;
+    guint8 detected_proto_version;
 } mqtt_conv_t;
 
 typedef struct _mqtt_message_decode_t {
@@ -564,6 +568,7 @@ static int hf_mqtt_property_id = -1;
 static int hf_mqtt_prop_num = -1;
 static int hf_mqtt_prop_max_qos = -1;
 static int hf_mqtt_prop_unknown = -1;
+static int hf_mqtt_prop_binary = -1;
 static int hf_mqtt_prop_string_len = -1;
 static int hf_mqtt_prop_string = -1;
 static int hf_mqtt_prop_key_len = -1;
@@ -584,7 +589,33 @@ static gint ett_mqtt_subscription_flags = -1;
 static gboolean reassemble_mqtt_over_tcp = TRUE;
 
 /* Show Publish Message as text */
-static gboolean show_msg_as_text;
+/* options */
+#define MSG_AS_TEXT_AUTO    0
+#define MSG_AS_TEXT_ALWAYS  1
+#define MSG_AS_TEXT_NEVER   2
+static gint show_msg_as_text = MSG_AS_TEXT_AUTO;
+static gboolean msg_is_text = FALSE;
+
+const enum_val_t msg_as_text_options[] = {
+    {"auto",   "Auto",   MSG_AS_TEXT_AUTO},
+    {"always", "Always", MSG_AS_TEXT_ALWAYS},
+    {"never",  "Never",  MSG_AS_TEXT_NEVER},
+    {NULL,     NULL,     -1}
+};
+
+#define SHOW_AS_PROTOCOL_VERSION_AUTO    0
+#define SHOW_AS_PROTOCOL_VERSION_31      1
+#define SHOW_AS_PROTOCOL_VERSION_311     2
+#define SHOW_AS_PROTOCOL_VERSION_50      3
+static gint show_packet_as_version = SHOW_AS_PROTOCOL_VERSION_AUTO;
+
+const enum_val_t packet_as_version_options[] = {
+    {"auto",   "Auto",   SHOW_AS_PROTOCOL_VERSION_AUTO},
+    {"v3.1",   "v3.1",   SHOW_AS_PROTOCOL_VERSION_31},
+    {"v3.1.1", "v3.1.1", SHOW_AS_PROTOCOL_VERSION_311},
+    {"v5",     "v5.0",   SHOW_AS_PROTOCOL_VERSION_50},
+    {NULL,     NULL,     -1}
+};
 
 static guint get_mqtt_pdu_len(packet_info *pinfo _U_, tvbuff_t *tvb,
                               int offset, void *data _U_)
@@ -802,6 +833,16 @@ static guint dissect_mqtt_properties(tvbuff_t *tvb, proto_tree *mqtt_tree, guint
     switch (prop_id)
     {
       case PROP_PAYLOAD_FORMAT_INDICATOR:
+      {
+        guint32 pfi;
+        proto_tree_add_item_ret_uint(mqtt_prop_tree, hf_mqtt_prop_num, tvb, offset, 1, ENC_BIG_ENDIAN, &pfi);
+        if (pfi == 1) {
+            msg_is_text = TRUE;
+        }
+        offset += 1;
+        break;
+      }
+
       case PROP_REQUEST_PROBLEM_INFORMATION:
       case PROP_REQUEST_RESPONSE_INFORMATION:
       case PROP_RETAIN_AVAILABLE:
@@ -820,7 +861,12 @@ static guint dissect_mqtt_properties(tvbuff_t *tvb, proto_tree *mqtt_tree, guint
       case PROP_SERVER_KEEP_ALIVE:
       case PROP_RECEIVE_MAXIMUM:
       case PROP_TOPIC_ALIAS_MAXIMUM:
+        proto_tree_add_item(mqtt_prop_tree, hf_mqtt_prop_num, tvb, offset, 2, ENC_BIG_ENDIAN);
+        offset += 2;
+        break;
+
       case PROP_TOPIC_ALIAS:
+        // TODO: Support Topic Alias mapping
         proto_tree_add_item(mqtt_prop_tree, hf_mqtt_prop_num, tvb, offset, 2, ENC_BIG_ENDIAN);
         offset += 2;
         break;
@@ -842,11 +888,38 @@ static guint dissect_mqtt_properties(tvbuff_t *tvb, proto_tree *mqtt_tree, guint
       }
 
       case PROP_CONTENT_TYPE:
+      {
+        const guint8 *content_type;
+        guint32 prop_len;
+
+        proto_tree_add_item_ret_uint(mqtt_prop_tree, hf_mqtt_prop_string_len, tvb, offset, 2, ENC_BIG_ENDIAN, &prop_len);
+        proto_tree_add_item_ret_string(mqtt_prop_tree, hf_mqtt_prop_string, tvb, offset + 2, prop_len, ENC_UTF_8|ENC_NA, wmem_packet_scope(), &content_type);
+        offset += 2 + prop_len;
+
+        // TODO: Convert to a preference
+        if (msg_is_text == FALSE && content_type) {
+          msg_is_text = msg_is_text || (strcmp(content_type, "text/plain") == 0);
+          msg_is_text = msg_is_text || (strcmp(content_type, "application/json") == 0);
+          msg_is_text = msg_is_text || (strcmp(content_type, "text/html") == 0);
+          msg_is_text = msg_is_text || (strcmp(content_type, "text/xml") == 0);
+          msg_is_text = msg_is_text || (strcmp(content_type, "application/xml") == 0);
+        }
+        break;
+      }
+
+      case PROP_CORRELATION_DATA: 
+      case PROP_AUTH_DATA:
+      {
+        guint32 prop_len;
+        proto_tree_add_item_ret_uint(mqtt_prop_tree, hf_mqtt_prop_string_len, tvb, offset, 2, ENC_BIG_ENDIAN, &prop_len);
+        proto_tree_add_item(mqtt_prop_tree, hf_mqtt_prop_binary, tvb, offset + 2, prop_len, ENC_NA);
+        offset += 2 + prop_len;
+        break;
+      }
+
       case PROP_RESPONSE_TOPIC:
-      case PROP_CORRELATION_DATA:
       case PROP_ASSIGNED_CLIENT_IDENTIFIER:
       case PROP_AUTH_METHOD:
-      case PROP_AUTH_DATA:
       case PROP_RESPONSE_INFORMATION:
       case PROP_SERVER_REFERENCE:
       case PROP_REASON_STRING:
@@ -859,7 +932,7 @@ static guint dissect_mqtt_properties(tvbuff_t *tvb, proto_tree *mqtt_tree, guint
         break;
 
       default:
-        proto_tree_add_item(mqtt_prop_tree, hf_mqtt_prop_unknown, tvb, offset, bytes_to_read - offset, ENC_UTF_8|ENC_NA);
+        proto_tree_add_item(mqtt_prop_tree, hf_mqtt_prop_unknown, tvb, offset, bytes_to_read - offset, ENC_NA);
         offset += (bytes_to_read - offset);
         break;
     }
@@ -875,6 +948,7 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
   guint8  mqtt_msg_type;
   proto_item *ti;
   const guint8 *topic_str;
+  const guint8 *msg_str;
   proto_tree *mqtt_tree;
   guint64     mqtt_con_flags;
   guint64     msg_len      = 0;
@@ -962,6 +1036,18 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
   /* Add the type to the MQTT tree item */
   proto_item_append_text(mqtt_tree, ", %s", val_to_str_ext(mqtt_msg_type, &mqtt_msgtype_vals_ext, "Unknown (0x%02x)"));
 
+  if (show_packet_as_version != SHOW_AS_PROTOCOL_VERSION_AUTO) {
+    if (show_packet_as_version == SHOW_AS_PROTOCOL_VERSION_31) {
+      mqtt->runtime_proto_version = MQTT_PROTO_V31;
+    } else if (show_packet_as_version == SHOW_AS_PROTOCOL_VERSION_311) {
+      mqtt->runtime_proto_version = MQTT_PROTO_V311;
+    } else if (show_packet_as_version == SHOW_AS_PROTOCOL_VERSION_50) {
+      mqtt->runtime_proto_version = MQTT_PROTO_V50;
+    } else {
+      show_packet_as_version = SHOW_AS_PROTOCOL_VERSION_AUTO;
+    }
+  }
+
   if (mqtt_msg_type == MQTT_PUBLISH)
   {
     proto_tree_add_bitmask(mqtt_tree, tvb, offset, hf_mqtt_hdrflags, ett_mqtt_hdr_flags, publish_fields, ENC_BIG_ENDIAN);
@@ -984,6 +1070,8 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
   proto_tree_add_uint64(mqtt_tree, hf_mqtt_msg_len, tvb, offset, mqtt_len_offset, msg_len);
   offset += mqtt_len_offset;
 
+  msg_is_text = FALSE;
+
   switch (mqtt_msg_type)
   {
     case MQTT_CONNECT:
@@ -993,7 +1081,10 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
       proto_tree_add_item(mqtt_tree, hf_mqtt_proto_name, tvb, offset, mqtt_str_len, ENC_UTF_8|ENC_NA);
       offset += mqtt_str_len;
 
-      mqtt->runtime_proto_version = tvb_get_guint8(tvb, offset);
+      mqtt->detected_proto_version = tvb_get_guint8(tvb, offset);
+      if (show_packet_as_version == SHOW_AS_PROTOCOL_VERSION_AUTO) {
+          mqtt->runtime_proto_version = mqtt->detected_proto_version;
+      }
 
       proto_tree_add_item(mqtt_tree, hf_mqtt_proto_ver, tvb, offset, 1, ENC_BIG_ENDIAN);
       offset += 1;
@@ -1032,7 +1123,7 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
         proto_tree_add_item_ret_uint(mqtt_tree, hf_mqtt_will_msg_len, tvb, offset, 2, ENC_BIG_ENDIAN, &mqtt_str_len);
         offset += 2;
 
-        if (show_msg_as_text)
+        if (show_msg_as_text == MSG_AS_TEXT_ALWAYS || (show_msg_as_text == MSG_AS_TEXT_AUTO && msg_is_text))
         {
           proto_tree_add_item(mqtt_tree, hf_mqtt_will_msg_text, tvb, offset, mqtt_str_len, ENC_UTF_8|ENC_NA);
         }
@@ -1040,6 +1131,7 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
         {
           proto_tree_add_item(mqtt_tree, hf_mqtt_will_msg, tvb, offset, mqtt_str_len, ENC_NA);
         }
+
         offset += mqtt_str_len;
       }
 
@@ -1110,7 +1202,8 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
         col_append_fstr(pinfo->cinfo, COL_INFO, " (id=%u)", mqtt_msgid);
       }
 
-      col_append_fstr(pinfo->cinfo, COL_INFO, " [%s]", topic_str);
+      // TODO: Add preference for this?
+      col_append_fstr(pinfo->cinfo, COL_INFO, " %s", topic_str);
 
       if (mqtt->runtime_proto_version == MQTT_PROTO_V50)
       {
@@ -1118,9 +1211,12 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
       }
 
       mqtt_payload_len = tvb_reported_length(tvb) - offset;
-      if (show_msg_as_text)
+
+      if (show_msg_as_text == MSG_AS_TEXT_ALWAYS || (show_msg_as_text == MSG_AS_TEXT_AUTO && msg_is_text))
       {
-        proto_tree_add_item(mqtt_tree, hf_mqtt_pubmsg_text, tvb, offset, mqtt_payload_len, ENC_UTF_8|ENC_NA);
+        proto_tree_add_item_ret_string(mqtt_tree, hf_mqtt_pubmsg_text, tvb, offset, mqtt_payload_len, ENC_UTF_8|ENC_NA, wmem_epan_scope(), &msg_str);
+        // TODO: Add preference for this?
+        col_append_fstr(pinfo->cinfo, COL_INFO, " %s", msg_str);
       }
       else
       {
@@ -1157,6 +1253,7 @@ static int dissect_mqtt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
                                        wmem_epan_scope(), &topic_str);
         offset += mqtt_str_len;
 
+        // TODO: Add preference for this?
         col_append_fstr(pinfo->cinfo, COL_INFO, " [%s]", topic_str);
 
         if (mqtt->runtime_proto_version == MQTT_PROTO_V50)
@@ -1607,7 +1704,11 @@ void proto_register_mqtt(void)
         NULL, HFILL }},
     { &hf_mqtt_prop_unknown,
       { "Unknown Property", "mqtt.prop_unknown",
-        FT_STRING, BASE_NONE, NULL, 0,
+        FT_BYTES, BASE_NONE, NULL, 0,
+        NULL, HFILL }},
+    { &hf_mqtt_prop_binary,
+      { "Data", "mqtt.prop_data",
+        FT_BYTES, BASE_NONE, NULL, 0,
         NULL, HFILL }},
     { &hf_mqtt_prop_string_len,
       { "Length", "mqtt.prop_string_len",
@@ -1688,11 +1789,15 @@ void proto_register_mqtt(void)
                                 "A table that enumerates custom message decodes to be used for a certain topic",
                                 message_uat);
 
-  prefs_register_bool_preference(mqtt_module, "show_msg_as_text",
+  prefs_register_enum_preference(mqtt_module, "show_msg_as_text",
                                  "Show Message as text",
                                  "Show Publish Message as text",
-                                 &show_msg_as_text);
+                                 &show_msg_as_text, msg_as_text_options, FALSE);
 
+  prefs_register_enum_preference(mqtt_module, "show_packet_as_version",
+                                 "Decode MQTT packets as version",
+                                 "Decode Publish Message as version",
+                                 &show_packet_as_version, packet_as_version_options, FALSE);
 }
 
 /*
@@ -1701,6 +1806,7 @@ void proto_register_mqtt(void)
 void proto_reg_handoff_mqtt(void)
 {
   dissector_add_uint_with_preference("tcp.port", MQTT_DEFAULT_PORT, mqtt_handle);
+  dissector_add_uint_with_preference("udp.port", MQTT_DEFAULT_PORT, mqtt_handle);
   ssl_dissector_add(MQTT_SSL_DEFAULT_PORT, mqtt_handle);
 }
 
